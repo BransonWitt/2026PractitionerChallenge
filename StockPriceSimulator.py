@@ -860,4 +860,4 @@ class simulateStockData:
             self.plotMonteCarlo(simulationDataframe, numPaths, plotType=default["plotType"], compareColumn=compareColumn)
         
         else:
-            return simulateStockData
+            return simulationDataframe

@@ -10,7 +10,6 @@ from scipy.stats import gaussian_kde, iqr
 from collections import OrderedDict
 from matplotlib.gridspec import GridSpec
 
-
 class simulateStockData:
     def __init__(self, ticker:str, period:int, interval:str) -> None:
         """Initializes a Stock price simulator
@@ -593,7 +592,7 @@ class simulateStockData:
         
     
     
-    def singleJump(self, lastJump: float, method:str = "whole") -> float:
+    def singleJump(self, lastJump: float) -> float:
         """Takes in the last jump that happened, finds the quartile of it, then samples from the conditional 
         distribution of all jumps that happened after a jump in the same quartile
 
@@ -604,27 +603,15 @@ class simulateStockData:
         Returns:
             float: New jump sampled from the distribution of jumps that happen after the quartile of the last jump
         """
-        # Seeing if a valid method is passed through
-        try:
-            assert(method in ["whole", "quartile"])
-        except:
-            ValueError("Invalid simulation sampling method used. Either use whole or quartile")
         
-        # Quartile sampling
-        if method == "quartile":
-            # Getting the quartile of the last jump
-            conditionalQuartile = self.returnQuartile(lastJump)
+        # Getting the quartile of the last jump
+        conditionalQuartile = self.returnQuartile(lastJump)
             
-            # Getting the KDE of the jumps after the jumps in the same quartile
-            samplingKDE = self.next_jump_KDEs[conditionalQuartile]
-            
-            
-            # Sampling a new value from the conditional KDE
-            newJump = samplingKDE.resample(1)
-        
-        # Whole distribution sampling
-        elif method == "whole":
-            newJump = self.__wholeKDE.resample(1)
+        # Getting the KDE of the jumps after the jumps in the same quartile
+        samplingKDE = self.next_jump_KDEs[conditionalQuartile]
+               
+        # Sampling a new value from the conditional KDE
+        newJump = samplingKDE.resample(1)
         
         # Returning the new jump to do
         return newJump.item(0)
@@ -658,30 +645,41 @@ class simulateStockData:
         # List of the price history 
         priceHistory = [startingPrice]
         
-        # Last jump
-        lastJump = 0
-        
-        # For loop to go over all the price jumps
-        for i in range(steps):
+        if method == "whole":
+            # Getting a history of jumps
+            jumpHistory = self.__wholeKDE.resample(steps - 1).flatten()
             
-            # Base Case Condition for first jump
-            if i == 0:
-                # Getting a jump based off the whole distribution
-                lastJump = self.__wholeKDE.resample(1).item(0)
+            # Adding price to jump history
+            jumpHistory = np.concatenate((priceHistory, jumpHistory))
+            
+            # Getting the cummulative sum
+            priceHistory = np.cumsum(jumpHistory)
+        
+        elif method == "quartile":
+            # Last jump
+            lastJump = 0
+            
+            # For loop to go over all the price jumps
+            for i in range(steps):
                 
-                # Adding new jump to price history
-                priceHistory.append(priceHistory[-1] + lastJump)
-                
-            # All other jumps
-            else:
-                # Getting a new jump
-                newJump = self.singleJump(lastJump, method)
-                
-                # Adding new jump to price history
-                priceHistory.append(priceHistory[-1] + lastJump)
-                
-                # Setting new jump to the last jump
-                lastJump = newJump
+                # Base Case Condition for first jump
+                if i == 0:
+                    # Getting a jump based off the whole distribution
+                    lastJump = self.__wholeKDE.resample(1).item(0)
+                    
+                    # Adding new jump to price history
+                    priceHistory.append(priceHistory[-1] + lastJump)
+                    
+                # All other jumps
+                else:
+                    # Getting a new jump
+                    newJump = self.singleJump(lastJump)
+                    
+                    # Adding new jump to price history
+                    priceHistory.append(priceHistory[-1] + lastJump)
+                    
+                    # Setting new jump to the last jump
+                    lastJump = newJump
         
         return priceHistory
     

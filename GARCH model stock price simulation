@@ -236,3 +236,11 @@ df_sigma.to_csv('garch_t_sigma_pct_scale.csv', index=False)
 print("\nSaved to:")
 print("  - garch_t_prices_pct_scale.csv")
 print("  - garch_t_sigma_pct_scale.csv")
+
+
+# ================
+# Graph
+# ================
+
+from StockPriceSimulator import simulateStockData
+

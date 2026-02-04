@@ -1,70 +1,73 @@
 import numpy as np
 import pandas as pd
+from scipy.stats import t as t_dist
 import yfinance as yf
-from arch import arch_model
 import time
 
 # =============================================================================
-# STEP 1: DOWNLOAD AND FIT
+# STEP 1: DOWNLOAD ACTUAL S&P 500 DATA (5 YEARS)
 # =============================================================================
 
 print("Downloading S&P 500 data...")
 data = yf.download("^GSPC", start="2021-01-01", end="2026-02-01")
 
+# Handle MultiIndex columns
 if isinstance(data.columns, pd.MultiIndex):
-    close_prices = data['Close']['^GSPC']
+    actual_prices = data['Close']['^GSPC']
 else:
-    close_prices = data['Close']
+    actual_prices = data['Close']
 
-# Percentage returns (same scale as arch fitting)
-returns_pct = 100 * np.log(close_prices / close_prices.shift(1)).dropna()
-
-dates = close_prices.index
-n_days = len(close_prices)
-S0 = float(close_prices.iloc[0])
+dates = actual_prices.index
+n_days = len(actual_prices)
+S0 = float(actual_prices.iloc[0])
 
 print(f"Downloaded {n_days:,} trading days")
-print(f"Starting price: ${S0:,.2f}")
+print(f"Date range: {dates[0].strftime('%Y-%m-%d')} to {dates[-1].strftime('%Y-%m-%d')}")
+print(f"Starting price (S0): ${S0:,.2f}")
 
-# Fit GARCH
-print("\nFitting GARCH(1,1)-t...")
-model = arch_model(returns_pct, vol='Garch', p=1, q=1, dist='normal')  # Use normal for stability
-result = model.fit(disp='off')
+# =============================================================================
+# STEP 2: GARCH PARAMETERS (all in DECIMAL form)
+# =============================================================================
 
-mu = result.params['mu']
-omega = result.params['omega']
-alpha = result.params['alpha[1]']
-beta = result.params['beta[1]']
+# Daily parameters (decimal scale)
+mu_annual = 0.08                    # 8% annual return
+mu_daily = mu_annual / 252          # Daily mean return
 
-print(f"\nFitted Parameters (percentage scale):")
-print(f"  μ = {mu:.6f}")
-print(f"  ω = {omega:.6f}")
-print(f"  α = {alpha:.4f}")
-print(f"  β = {beta:.4f}")
+sigma0_annual = 0.20                # 20% annualized volatility
+var0_daily = (sigma0_annual ** 2) / 252  # Daily variance
+
+# GARCH parameters (fitted to decimal returns)
+omega = 0.000001                    # Variance intercept (very small in decimal)
+alpha = 0.10                        # ARCH coefficient
+beta = 0.89                         # GARCH coefficient (α + β = 0.99)
+nu = 5.34                           # t-distribution df
+
+# Verify long-run volatility
+long_run_var_daily = omega / (1 - alpha - beta)
+long_run_vol_annual = np.sqrt(long_run_var_daily * 252)
+print(f"\nGARCH Parameters:")
+print(f"  μ (annual): {mu_annual:.1%}")
+print(f"  σ₀ (annual): {sigma0_annual:.1%}")
 print(f"  α + β = {alpha + beta:.4f}")
-
-# Long-run volatility
-long_run_var = omega / (1 - alpha - beta)
-long_run_vol = np.sqrt(long_run_var * 252)
-print(f"  Long-run annualized volatility: {long_run_vol:.2f}%")
+print(f"  Long-run annualized volatility: {long_run_vol_annual:.1%}")
 
 # =============================================================================
-# STEP 2: SIMULATE IN PERCENTAGE SCALE (matching fitted scale)
+# STEP 3: DAILY GARCH SIMULATION (DECIMAL SCALE)
 # =============================================================================
 
-def simulate_garch_percentage_scale(
+def simulate_garch_daily(
     S0: float,
     n_days: int,
     n_scenarios: int,
-    mu: float,           # In percentage (e.g., 0.05 means 0.05%)
-    omega: float,        # In percentage squared
+    mu_daily: float,
+    omega: float,
     alpha: float,
     beta: float,
-    var0: float = None,  # Initial variance in %²
-    var_max: float = 25.0  # Max daily variance (5% daily vol → 25 var)
+    nu: float,
+    var0_daily: float
 ) -> np.ndarray:
     """
-    GARCH simulation in PERCENTAGE scale (matching arch package output).
+    Daily GARCH(1,1)-t simulation in DECIMAL scale.
     """
     
     print(f"\nSimulating {n_scenarios:,} scenarios × {n_days:,} days...")
@@ -73,34 +76,28 @@ def simulate_garch_percentage_scale(
     S_paths = np.zeros((n_scenarios, n_days))
     S_paths[:, 0] = S0
     
-    # Initial variance (use long-run variance if not specified)
-    if var0 is None:
-        var0 = omega / (1 - alpha - beta)
-    
-    var_daily = np.full(n_scenarios, var0)  # In %²
+    # Initialize daily variance
+    var_daily = np.full(n_scenarios, var0_daily)
     S_current = np.full(n_scenarios, S0)
     
     for day in range(1, n_days):
-        # Normal shocks
-        z = np.random.standard_normal(n_scenarios)
+        # t-distributed shocks
+        z = t_dist.rvs(df=nu, size=n_scenarios)
+        z = z / np.sqrt(nu / (nu - 2))  # Standardize to unit variance
         
-        # Shock in percentage scale
-        sigma_pct = np.sqrt(var_daily)      # In %
-        eps_pct = sigma_pct * z             # In %
+        # Daily shock (in decimal)
+        sigma_daily = np.sqrt(var_daily)
+        eps = sigma_daily * z
         
-        # Return in percentage, then convert to decimal for price update
-        return_pct = mu + eps_pct           # In %
-        return_decimal = return_pct / 100   # Convert to decimal
+        # Daily return (in decimal)
+        daily_return = mu_daily + eps
         
         # Update price
-        S_current = S_current * np.exp(return_decimal)
+        S_current = S_current * np.exp(daily_return)
         S_paths[:, day] = S_current
         
-        # GARCH variance update (in %² scale)
-        var_daily = omega + alpha * (eps_pct ** 2) + beta * var_daily
-        
-        # Variance bound to prevent explosion
-        var_daily = np.minimum(var_daily, var_max)
+        # GARCH variance update
+        var_daily = omega + alpha * (eps ** 2) + beta * var_daily
         
         if day % 500 == 0:
             print(f"  Day {day:,}/{n_days:,}")
@@ -109,55 +106,53 @@ def simulate_garch_percentage_scale(
     return S_paths
 
 # =============================================================================
-# STEP 3: RUN SIMULATION
+# STEP 4: RUN SIMULATION
 # =============================================================================
 
-n_scenarios = 500
+n_scenarios = 1000
 
-S_paths = simulate_garch_percentage_scale(
+S_paths = simulate_garch_daily(
     S0=S0,
     n_days=n_days,
     n_scenarios=n_scenarios,
-    mu=0.04,
+    mu_daily=mu_daily,
     omega=omega,
     alpha=alpha,
     beta=beta,
-    var_max=25.0  # Cap at ~5% daily vol (~80% annual)
+    nu=nu,
+    var0_daily=var0_daily
 )
 
 # =============================================================================
-# STEP 4: CHECK RESULTS
+# STEP 5: VERIFY RESULTS ARE REASONABLE
 # =============================================================================
 
 terminal_prices = S_paths[:, -1]
-actual_terminal = float(close_prices.iloc[-1])
+actual_terminal = float(actual_prices.iloc[-1])
 
 print(f"\nTerminal Price Check:")
-print(f"  Actual S&P 500:      ${actual_terminal:,.2f}")
-print(f"  Simulated mean:      ${np.mean(terminal_prices):,.2f}")
-print(f"  Simulated median:    ${np.median(terminal_prices):,.2f}")
-print(f"  Simulated min:       ${np.min(terminal_prices):,.2f}")
-print(f"  Simulated max:       ${np.max(terminal_prices):,.2f}")
-print(f"  5th percentile:      ${np.percentile(terminal_prices, 5):,.2f}")
-print(f"  95th percentile:     ${np.percentile(terminal_prices, 95):,.2f}")
-
-# Check for unrealistic paths
-unrealistic = np.sum((terminal_prices > 20000) | (terminal_prices < 1000))
-print(f"\n  Unrealistic paths:   {unrealistic} / {n_scenarios} ({unrealistic/n_scenarios:.1%})")
+print(f"  Actual S&P 500: ${actual_terminal:,.2f}")
+print(f"  Simulated mean: ${np.mean(terminal_prices):,.2f}")
+print(f"  Simulated median: ${np.median(terminal_prices):,.2f}")
+print(f"  Simulated range: ${np.min(terminal_prices):,.2f} - ${np.max(terminal_prices):,.2f}")
+print(f"  5th-95th percentile: ${np.percentile(terminal_prices, 5):,.2f} - ${np.percentile(terminal_prices, 95):,.2f}")
 
 # =============================================================================
-# STEP 5: CREATE DATAFRAME
+# STEP 6: CREATE DATAFRAME
 # =============================================================================
 
-df = pd.DataFrame({'Date': dates, 'Actual': close_prices.values})
+print("\nCreating DataFrame...")
+
+df = pd.DataFrame({
+    'Date': dates,
+    'Actual': actual_prices.values
+})
+
 for i in range(n_scenarios):
     df[f'Simulation {i}'] = S_paths[i, :]
 
-df.to_csv('garch_simulations_correct_scale.csv', index=False)
-print(f"\nSaved to 'garch_simulations_correct_scale.csv'")
+print(f"DataFrame shape: {df.shape}")
 
-from StockPriceSimulator import simulateStockData
-
-stock = simulateStockData("AAPL", 365, '1d')
-
-stock.plotMonteCarlo(df, 1, compareColumn="Actual")
+# Save
+df.to_csv('garch_simulations_5yr.csv', index=False)
+print("Saved to 'garch_simulations_5yr.csv'")

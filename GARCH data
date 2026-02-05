@@ -1,0 +1,278 @@
+import numpy as np
+import pandas as pd
+from scipy.stats import t as t_dist
+from arch import arch_model
+import yfinance as yf
+import time
+import os
+
+# =============================================================================
+# STEP 1: DOWNLOAD FTSE DATA AND FIT GARCH
+# =============================================================================
+
+print("=" * 70)
+print("STEP 1: DOWNLOADING FTSE DATA AND FITTING GARCH MODEL")
+print("=" * 70)
+
+data = yf.download("^FTSE", start="2019-01-01", end="2025-01-01")
+
+if isinstance(data.columns, pd.MultiIndex):
+    close_prices = data['Close']['^FTSE']
+else:
+    close_prices = data['Close']
+
+S0 = float(close_prices.iloc[-1])
+
+print(f"Downloaded {len(close_prices):,} trading days")
+print(f"S_0 (initial stock price): £{S0:,.2f}")
+
+# Fit GARCH(1,1)-t
+returns_pct = 100 * np.log(close_prices / close_prices.shift(1)).dropna()
+
+print("\nFitting GARCH(1,1)-t model...")
+model = arch_model(returns_pct, vol='Garch', p=1, q=1, dist='t')
+result = model.fit(disp='off')
+
+mu = result.params['mu']
+omega = result.params['omega']
+alpha = result.params['alpha[1]']
+beta = result.params['beta[1]']
+nu = result.params['nu']
+
+print(f"Parameters: μ={mu:.4f}%, ω={omega:.6f}, α={alpha:.4f}, β={beta:.4f}, ν={nu:.2f}")
+
+# =============================================================================
+# STEP 2: PARAMETERS
+# =============================================================================
+
+print("\n" + "=" * 70)
+print("STEP 2: SIMULATION PARAMETERS")
+print("=" * 70)
+
+n_simulations = 500000
+T_choices = np.array([1, 2, 3, 4, 5])
+K_percentages = np.array([0.60, 0.70, 0.80, 0.90, 1.00, 1.10, 1.20, 1.30, 1.40, 1.50])
+days_per_year = 252
+mu_adjusted = 0.04
+
+print(f"Total simulations: {n_simulations:,}")
+print(f"T choices: {T_choices} years")
+print(f"K choices: {K_percentages * 100}%")
+
+# =============================================================================
+# STEP 3: ASSIGN T AND K
+# =============================================================================
+
+print("\n" + "=" * 70)
+print("STEP 3: ASSIGNING T AND K")
+print("=" * 70)
+
+np.random.seed(42)
+
+T_assignments = np.random.choice(T_choices, size=n_simulations)
+K_pct_assignments = np.random.choice(K_percentages, size=n_simulations)
+K_assignments = S0 * K_pct_assignments
+
+print(f"T distribution:")
+for t in T_choices:
+    count = np.sum(T_assignments == t)
+    print(f"  T={t}: {count:,} ({count/n_simulations*100:.1f}%)")
+
+# =============================================================================
+# STEP 4: VECTORIZED GARCH SIMULATION FUNCTION
+# =============================================================================
+
+def simulate_garch_vectorized(S0, n_days, n_scenarios, mu, omega, alpha, beta, nu):
+    """
+    Fully vectorized GARCH(1,1)-t simulation.
+    """
+    
+    var0 = omega / (1 - alpha - beta)
+    
+    S_paths = np.zeros((n_scenarios, n_days))
+    sigma_paths = np.zeros((n_scenarios, n_days))
+    
+    S_paths[:, 0] = S0
+    sigma_paths[:, 0] = np.sqrt(var0)
+    
+    var_current = np.full(n_scenarios, var0)
+    S_current = np.full(n_scenarios, S0)
+    
+    for day in range(1, n_days):
+        z = t_dist.rvs(df=nu, size=n_scenarios) / np.sqrt(nu / (nu - 2))
+        
+        sigma_current = np.sqrt(var_current)
+        eps = sigma_current * z
+        return_pct = mu + eps
+        
+        S_current = S_current * np.exp(return_pct / 100)
+        
+        S_paths[:, day] = S_current
+        sigma_paths[:, day] = sigma_current
+        
+        var_current = omega + alpha * (eps ** 2) + beta * var_current
+        var_current = np.minimum(var_current, 25.0)
+    
+    return S_paths, sigma_paths
+
+# =============================================================================
+# STEP 5: RUN SIMULATIONS BY T GROUP (VECTORIZED)
+# =============================================================================
+
+print("\n" + "=" * 70)
+print("STEP 4: RUNNING SIMULATIONS (VECTORIZED)")
+print("=" * 70)
+
+output_dir = 'garch_simulation_data'
+os.makedirs(output_dir, exist_ok=True)
+
+total_start = time.time()
+
+for T in T_choices:
+    group_start = time.time()
+    
+    # Find all simulations with this T
+    mask = T_assignments == T
+    sim_indices = np.where(mask)[0]
+    n_sims_this_T = len(sim_indices)
+    n_days = T * days_per_year
+    
+    print(f"\nT = {T} years: {n_sims_this_T:,} simulations × {n_days} days")
+    
+    # Get K values for these simulations
+    K_values_this_T = K_assignments[sim_indices]
+    
+    # --- VECTORIZED GARCH SIMULATION ---
+    print(f"  Running GARCH simulation...")
+    sim_start = time.time()
+    
+    S_paths, sigma_paths = simulate_garch_vectorized(
+        S0=S0,
+        n_days=n_days,
+        n_scenarios=n_sims_this_T,
+        mu=mu_adjusted,
+        omega=omega,
+        alpha=alpha,
+        beta=beta,
+        nu=nu
+    )
+    
+    print(f"  GARCH done in {time.time() - sim_start:.1f}s")
+    
+    # --- BUILD DATASET (VECTORIZED) ---
+    print(f"  Building dataset...")
+    build_start = time.time()
+    
+    n_rows = n_sims_this_T * n_days
+    
+    simulation_col = np.repeat(sim_indices, n_days)
+    day_col = np.tile(np.arange(n_days), n_sims_this_T)
+    S_col = S_paths.flatten()
+    K_col = np.repeat(K_values_this_T, n_days)
+    T_sequence = T - np.arange(n_days) / days_per_year
+    T_col = np.tile(T_sequence, n_sims_this_T)
+    sigma_col = sigma_paths.flatten() * np.sqrt(days_per_year) / 100
+    
+    print(f"  Arrays built in {time.time() - build_start:.1f}s")
+    
+    # --- CREATE AND SAVE DATAFRAME ---
+    print(f"  Creating DataFrame...")
+    df_start = time.time()
+    
+    df_T = pd.DataFrame({
+        'simulation': simulation_col,
+        'day': day_col,
+        'S': S_col,
+        'K': K_col,
+        'T': T_col,
+        'sigma': sigma_col
+    })
+    
+    # Sort by simulation, then descending T
+    df_T = df_T.sort_values(
+        by=['simulation', 'T'],
+        ascending=[True, False]
+    ).reset_index(drop=True)
+    
+    print(f"  DataFrame created in {time.time() - df_start:.1f}s")
+    
+    # Save as CSV
+    filename = f'{output_dir}/T_{T}_years.csv'
+    df_T.to_csv(filename, index=False)
+    
+    group_time = time.time() - group_start
+    print(f"  Saved {len(df_T):,} rows to {filename}")
+    print(f"  Total time for T={T}: {group_time:.1f}s")
+    
+    # Memory cleanup
+    del S_paths, sigma_paths, df_T
+
+total_time = time.time() - total_start
+print(f"\n" + "=" * 70)
+print(f"SIMULATION COMPLETE! Total time: {total_time / 60:.1f} minutes")
+print("=" * 70)
+
+# =============================================================================
+# STEP 6: COMBINE ALL FILES
+# =============================================================================
+
+print("\n" + "=" * 70)
+print("STEP 5: COMBINING FILES")
+print("=" * 70)
+
+print("Loading all CSV files...")
+
+dfs = []
+for T in T_choices:
+    filename = f'{output_dir}/T_{T}_years.csv'
+    df = pd.read_csv(filename)
+    dfs.append(df)
+    print(f"  Loaded T={T}: {len(df):,} rows")
+
+df_combined = pd.concat(dfs, ignore_index=True)
+
+# Final sort
+print("\nFinal sorting...")
+df_combined = df_combined.sort_values(
+    by=['simulation', 'T'],
+    ascending=[True, False]
+).reset_index(drop=True)
+
+print(f"\nFinal dataset: {len(df_combined):,} rows")
+
+# =============================================================================
+# STEP 7: DISPLAY AND SAVE
+# =============================================================================
+
+print("\n" + "=" * 70)
+print("STEP 6: FINAL DATASET")
+print("=" * 70)
+
+print("\nFirst 20 rows:")
+print(df_combined.head(20))
+
+print("\nLast 20 rows:")
+print(df_combined.tail(20))
+
+print("\nStatistics:")
+print(df_combined.describe())
+
+# Example simulation
+sim_0 = df_combined[df_combined['simulation'] == 0]
+print(f"\nSimulation 0:")
+print(f"  T assigned: {sim_0['T'].iloc[0]:.4f} years")
+print(f"  K assigned: £{sim_0['K'].iloc[0]:,.2f}")
+print(f"  Rows: {len(sim_0)}")
+print(f"  T range: {sim_0['T'].max():.4f} → {sim_0['T'].min():.4f}")
+
+# Save final file as CSV
+print("\nSaving final dataset...")
+df_combined.to_csv('ftse_garch_simulation_data.csv', index=False)
+
+file_size_gb = os.path.getsize('ftse_garch_simulation_data.csv') / 1e9
+print(f"Saved to ftse_garch_simulation_data.csv")
+print(f"File size: {file_size_gb:.2f} GB")
+
+print("\n" + "=" * 70)
+print("DONE!")
+print("=" * 70)

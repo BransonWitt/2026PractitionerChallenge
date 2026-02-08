@@ -5,6 +5,38 @@ from arch import arch_model
 import yfinance as yf
 import time
 import os
+import json
+import hashlib
+
+# =============================================================================
+# REPRODUCIBILITY SETTINGS
+# =============================================================================
+
+MASTER_SEED = 42  # Change this to generate different datasets
+
+def set_all_seeds(seed):
+    """Set all random seeds for reproducibility"""
+    np.random.seed(seed)
+    # If using other libraries, set their seeds here
+    print(f"All seeds set to: {seed}")
+
+def compute_dataframe_hash(df, sample_size=10000):
+    """
+    Compute hash of dataframe to verify reproducibility.
+    Uses a sample to avoid memory issues with large datasets.
+    """
+    if len(df) > sample_size:
+        df_sample = df.sample(n=sample_size, random_state=42).sort_index()
+    else:
+        df_sample = df
+    
+    return hashlib.md5(pd.util.hash_pandas_object(df_sample).values).hexdigest()
+
+def save_metadata(metadata, filename='dataset_metadata.json'):
+    """Save generation metadata for verification"""
+    with open(filename, 'w') as f:
+        json.dump(metadata, f, indent=2)
+    print(f"\nMetadata saved to {filename}")
 
 # =============================================================================
 # STEP 1: DOWNLOAD FTSE DATA AND FIT GARCH
@@ -13,6 +45,9 @@ import os
 print("=" * 70)
 print("STEP 1: DOWNLOADING FTSE DATA AND FITTING GARCH MODEL")
 print("=" * 70)
+
+# Set seed before any random operations
+set_all_seeds(MASTER_SEED)
 
 data = yf.download("^FTSE", start="2019-01-01", end="2025-01-01")
 
@@ -59,15 +94,44 @@ print(f"Total simulations: {n_simulations:,}")
 print(f"T choices: {T_choices} years")
 print(f"K choices: {K_percentages * 100}%")
 
+# Store metadata for reproducibility
+metadata = {
+    'master_seed': MASTER_SEED,
+    'n_simulations': int(n_simulations),
+    'T_choices': T_choices.tolist(),
+    'K_percentages': K_percentages.tolist(),
+    'S0': float(S0),
+    'days_per_year': int(days_per_year),
+    'mu_adjusted': float(mu_adjusted),
+    'garch_params': {
+        'mu': float(mu),
+        'omega': float(omega),
+        'alpha': float(alpha),
+        'beta': float(beta),
+        'nu': float(nu)
+    },
+    'data_download': {
+        'ticker': '^FTSE',
+        'start_date': '2019-01-01',
+        'end_date': '2025-01-01',
+        'n_days': int(len(close_prices))
+    },
+    'python_version': os.sys.version,
+    'numpy_version': np.__version__,
+    'pandas_version': pd.__version__,
+    'generation_timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
+}
+
 # =============================================================================
-# STEP 3: ASSIGN T AND K
+# STEP 3: ASSIGN T AND K (WITH SEED CONTROL)
 # =============================================================================
 
 print("\n" + "=" * 70)
 print("STEP 3: ASSIGNING T AND K")
 print("=" * 70)
 
-np.random.seed(42)
+# CRITICAL: Set seed before random assignments
+np.random.seed(MASTER_SEED)
 
 T_assignments = np.random.choice(T_choices, size=n_simulations)
 K_pct_assignments = np.random.choice(K_percentages, size=n_simulations)
@@ -82,10 +146,15 @@ for t in T_choices:
 # STEP 4: VECTORIZED GARCH SIMULATION FUNCTION
 # =============================================================================
 
-def simulate_garch_vectorized(S0, n_days, n_scenarios, mu, omega, alpha, beta, nu):
+def simulate_garch_vectorized(S0, n_days, n_scenarios, mu, omega, alpha, beta, nu, seed=None):
     """
-    Fully vectorized GARCH(1,1)-t simulation.
+    Fully vectorized GARCH(1,1)-t simulation with seed control.
+    
+    Args:
+        seed: If provided, sets numpy seed before simulation
     """
+    if seed is not None:
+        np.random.seed(seed)
     
     var0 = omega / (1 - alpha - beta)
     
@@ -116,7 +185,7 @@ def simulate_garch_vectorized(S0, n_days, n_scenarios, mu, omega, alpha, beta, n
     return S_paths, sigma_paths
 
 # =============================================================================
-# STEP 5: RUN SIMULATIONS BY T GROUP (VECTORIZED)
+# STEP 5: RUN SIMULATIONS BY T GROUP (VECTORIZED WITH SEED CONTROL)
 # =============================================================================
 
 print("\n" + "=" * 70)
@@ -127,6 +196,9 @@ output_dir = 'garch_simulation_data'
 os.makedirs(output_dir, exist_ok=True)
 
 total_start = time.time()
+
+# Store hashes for verification
+file_hashes = {}
 
 for T in T_choices:
     group_start = time.time()
@@ -142,9 +214,12 @@ for T in T_choices:
     # Get K values for these simulations
     K_values_this_T = K_assignments[sim_indices]
     
-    # --- VECTORIZED GARCH SIMULATION ---
+    # --- VECTORIZED GARCH SIMULATION WITH SEED ---
     print(f"  Running GARCH simulation...")
     sim_start = time.time()
+    
+    # CRITICAL: Use deterministic seed for this T group
+    group_seed = MASTER_SEED + int(T * 1000)
     
     S_paths, sigma_paths = simulate_garch_vectorized(
         S0=S0,
@@ -154,7 +229,8 @@ for T in T_choices:
         omega=omega,
         alpha=alpha,
         beta=beta,
-        nu=nu
+        nu=nu,
+        seed=group_seed
     )
     
     print(f"  GARCH done in {time.time() - sim_start:.1f}s")
@@ -195,6 +271,11 @@ for T in T_choices:
     ).reset_index(drop=True)
     
     print(f"  DataFrame created in {time.time() - df_start:.1f}s")
+    
+    # Compute hash for verification
+    file_hash = compute_dataframe_hash(df_T)
+    file_hashes[f'T_{T}_years'] = file_hash
+    print(f"  Data hash: {file_hash}")
     
     # Save as CSV
     filename = f'{output_dir}/T_{T}_years.csv'
@@ -265,6 +346,10 @@ print(f"  K assigned: £{sim_0['K'].iloc[0]:,.2f}")
 print(f"  Rows: {len(sim_0)}")
 print(f"  T range: {sim_0['T'].max():.4f} → {sim_0['T'].min():.4f}")
 
+# Compute final hash
+final_hash = compute_dataframe_hash(df_combined)
+print(f"\nFinal dataset hash: {final_hash}")
+
 # Save final file as CSV
 print("\nSaving final dataset...")
 df_combined.to_csv('ftse_garch_simulation_data.csv', index=False)
@@ -273,6 +358,43 @@ file_size_gb = os.path.getsize('ftse_garch_simulation_data.csv') / 1e9
 print(f"Saved to ftse_garch_simulation_data.csv")
 print(f"File size: {file_size_gb:.2f} GB")
 
+# =============================================================================
+# STEP 8: SAVE METADATA AND VERIFICATION INFO
+# =============================================================================
+
+print("\n" + "=" * 70)
+print("STEP 7: SAVING METADATA FOR REPRODUCIBILITY")
+print("=" * 70)
+
+# Add hashes and final statistics to metadata
+metadata['file_hashes'] = file_hashes
+metadata['final_hash'] = final_hash
+metadata['total_rows'] = int(len(df_combined))
+metadata['file_size_gb'] = float(file_size_gb)
+metadata['total_generation_time_minutes'] = float(total_time / 60)
+
+# Save metadata
+save_metadata(metadata, f'{output_dir}/dataset_metadata.json')
+
+# Also save a verification file with just the hash
+verification = {
+    'master_seed': MASTER_SEED,
+    'final_hash': final_hash,
+    'file_hashes': file_hashes,
+    'total_rows': int(len(df_combined)),
+    'instructions': 'Run the generation script with MASTER_SEED={} to reproduce this exact dataset'.format(MASTER_SEED)
+}
+
+with open('REPRODUCIBILITY_INFO.json', 'w') as f:
+    json.dump(verification, f, indent=2)
+
+print(f"\nVerification info saved to REPRODUCIBILITY_INFO.json")
+
 print("\n" + "=" * 70)
 print("DONE!")
+print("=" * 70)
+print("\nTo reproduce this dataset on another computer:")
+print(f"1. Use MASTER_SEED = {MASTER_SEED}")
+print(f"2. Expected final hash: {final_hash}")
+print(f"3. Expected total rows: {len(df_combined):,}")
 print("=" * 70)

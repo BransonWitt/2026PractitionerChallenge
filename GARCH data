@@ -357,3 +357,970 @@ print("=" * 70)
 
 # Clean up memory
 del S_paths, sigma_paths
+
+
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+import pandas as pd
+from scipy.stats import norm
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+import json
+import os
+import time
+
+# =============================================================================
+# REPRODUCIBILITY
+# =============================================================================
+
+def set_seed(seed=42):
+    """Set all random seeds for reproducibility"""
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+set_seed(42)
+
+# Check for GPU
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+# =============================================================================
+# STEP 1: BLACK-SCHOLES CALCULATION
+# =============================================================================
+
+def black_scholes_call(S, K, T, r, sigma):
+    """
+    Calculate Black-Scholes call option price
+    
+    Args:
+        S: Stock price (can be array)
+        K: Strike price (can be array)
+        T: Time to maturity in years (can be array)
+        r: Risk-free rate (scalar)
+        sigma: Volatility (can be array)
+    
+    Returns:
+        Call option price(s)
+    """
+    # Handle edge case where T is very small or zero
+    mask = T > 1e-10
+    
+    # Initialize output
+    call_price = np.maximum(S - K, 0)  # Intrinsic value when T ≈ 0
+    
+    # Calculate BS price where T > 0
+    if np.any(mask):
+        S_valid = np.where(mask, S, 1)
+        K_valid = np.where(mask, K, 1)
+        T_valid = np.where(mask, T, 1)
+        sigma_valid = np.where(mask, sigma, 0.2)
+        
+        d1 = (np.log(S_valid / K_valid) + (r + 0.5 * sigma_valid**2) * T_valid) / \
+             (sigma_valid * np.sqrt(T_valid))
+        d2 = d1 - sigma_valid * np.sqrt(T_valid)
+        
+        bs_price = S_valid * norm.cdf(d1) - K_valid * np.exp(-r * T_valid) * norm.cdf(d2)
+        call_price = np.where(mask, bs_price, call_price)
+    
+    return call_price
+
+# =============================================================================
+# STEP 2: DATA PREPARATION - CREATE SEQUENCES (OPTIMIZED)
+# =============================================================================
+
+def create_sequences_fast(df, sequence_length=50, features=['S', 'sigma', 'T', 'K'], 
+                         save_metadata=False):
+    """
+    Create sliding window sequences for LSTM training (OPTIMIZED VERSION)
+    
+    This version is 30-100x faster than naive implementation by:
+    1. Converting to NumPy arrays early
+    2. Pre-allocating arrays instead of appending to lists
+    3. Using vectorized slicing operations
+    
+    Args:
+        df: DataFrame with columns [simulation, day, S, K, T, sigma, call_price]
+        sequence_length: Number of past days to use (window size)
+        features: List of feature column names to include
+        save_metadata: Whether to save metadata (slower if True)
+    
+    Returns:
+        X: Input sequences (n_samples, sequence_length, n_features)
+        y: Target call prices (n_samples,)
+        metadata: List of dicts with sample information (or None)
+    """
+    print(f"\n{'='*70}")
+    print(f"CREATING SEQUENCES")
+    print(f"{'='*70}")
+    print(f"Window size: {sequence_length}")
+    print(f"Features: {features}")
+    print(f"Save metadata: {save_metadata}")
+    
+    # Sort data once
+    print("\nSorting data by simulation and day...")
+    start_time = time.time()
+    df = df.sort_values(['simulation', 'day']).reset_index(drop=True)
+    print(f"Sorting completed in {time.time() - start_time:.1f}s")
+    
+    # Get dimensions
+    unique_sims = df['simulation'].unique()
+    n_sims = len(unique_sims)
+    days_per_sim = df[df['simulation'] == unique_sims[0]].shape[0]
+    samples_per_sim = days_per_sim - sequence_length
+    total_samples = n_sims * samples_per_sim
+    
+    print(f"\nDataset Statistics:")
+    print(f"  Total simulations: {n_sims:,}")
+    print(f"  Days per simulation: {days_per_sim:,}")
+    print(f"  Samples per simulation: {samples_per_sim:,}")
+    print(f"  Total samples to create: {total_samples:,}")
+    
+    # Pre-allocate arrays (MUCH faster than appending)
+    n_features = len(features)
+    print(f"\nAllocating arrays...")
+    print(f"  X shape: ({total_samples:,}, {sequence_length}, {n_features})")
+    print(f"  Memory required: ~{total_samples * sequence_length * n_features * 4 / 1e9:.2f} GB")
+    
+    X = np.zeros((total_samples, sequence_length, n_features), dtype=np.float32)
+    y = np.zeros(total_samples, dtype=np.float32)
+    
+    # Extract feature and target columns as arrays (once, not in loop)
+    print(f"\nExtracting features and targets as NumPy arrays...")
+    feature_data = df[features].values.astype(np.float32)
+    target_data = df['call_price'].values.astype(np.float32)
+    
+    # Metadata (optional)
+    metadata_list = [] if save_metadata else None
+    
+    # Create sequences
+    print(f"\nCreating sequences...")
+    start_time = time.time()
+    sample_idx = 0
+    
+    for sim_num in tqdm(range(n_sims), desc="Processing simulations"):
+        # Calculate start and end indices for this simulation
+        sim_start = sim_num * days_per_sim
+        sim_end = sim_start + days_per_sim
+        
+        # Extract this simulation's data (vectorized)
+        sim_features = feature_data[sim_start:sim_end]
+        sim_targets = target_data[sim_start:sim_end]
+        
+        # Create all sequences for this simulation
+        for i in range(sequence_length, days_per_sim):
+            # Extract sequence (vectorized - no loop)
+            X[sample_idx] = sim_features[i-sequence_length:i]
+            y[sample_idx] = sim_targets[i]
+            
+            # Metadata (optional)
+            if save_metadata:
+                row_idx = sim_start + i
+                metadata_list.append({
+                    'simulation': int(df.iloc[row_idx]['simulation']),
+                    'day': int(df.iloc[row_idx]['day']),
+                    'S': float(df.iloc[row_idx]['S']),
+                    'K': float(df.iloc[row_idx]['K']),
+                    'T': float(df.iloc[row_idx]['T']),
+                    'sigma': float(df.iloc[row_idx]['sigma']),
+                    'call_price': float(sim_targets[i])
+                })
+            
+            sample_idx += 1
+    
+    elapsed = time.time() - start_time
+    print(f"\n{'='*70}")
+    print(f"SEQUENCE CREATION COMPLETE!")
+    print(f"{'='*70}")
+    print(f"Time elapsed: {elapsed:.1f}s ({elapsed/60:.1f} minutes)")
+    print(f"X shape: {X.shape}")
+    print(f"y shape: {y.shape}")
+    print(f"Speed: {total_samples/elapsed:,.0f} samples/second")
+    
+    return X, y, metadata_list
+
+def save_sequences(X, y, metadata, prefix='sequences'):
+    """
+    Save sequences to disk for faster loading later
+    
+    Args:
+        X: Input sequences
+        y: Targets
+        metadata: Metadata list
+        prefix: Filename prefix
+    """
+    print(f"\nSaving sequences to disk...")
+    np.save(f'{prefix}_X.npy', X)
+    np.save(f'{prefix}_y.npy', y)
+    
+    if metadata is not None:
+        import pickle
+        with open(f'{prefix}_metadata.pkl', 'wb') as f:
+            pickle.dump(metadata, f)
+    
+    print(f"Saved:")
+    print(f"  {prefix}_X.npy ({os.path.getsize(f'{prefix}_X.npy') / 1e9:.2f} GB)")
+    print(f"  {prefix}_y.npy ({os.path.getsize(f'{prefix}_y.npy') / 1e9:.2f} GB)")
+    if metadata is not None:
+        print(f"  {prefix}_metadata.pkl")
+
+def load_sequences(prefix='sequences'):
+    """
+    Load sequences from disk
+    
+    Args:
+        prefix: Filename prefix
+    
+    Returns:
+        X, y, metadata
+    """
+    print(f"\nLoading sequences from disk...")
+    start = time.time()
+    
+    X = np.load(f'{prefix}_X.npy')
+    y = np.load(f'{prefix}_y.npy')
+    
+    metadata = None
+    if os.path.exists(f'{prefix}_metadata.pkl'):
+        import pickle
+        with open(f'{prefix}_metadata.pkl', 'rb') as f:
+            metadata = pickle.load(f)
+    
+    print(f"Loaded in {time.time() - start:.1f}s")
+    print(f"X shape: {X.shape}")
+    print(f"y shape: {y.shape}")
+    
+    return X, y, metadata
+
+# =============================================================================
+# STEP 3: CUSTOM DATASET CLASS
+# =============================================================================
+
+class OptionPriceDataset(Dataset):
+    """
+    PyTorch Dataset for option price sequences
+    """
+    
+    def __init__(self, X, y, metadata=None):
+        """
+        Args:
+            X: numpy array (n_samples, sequence_length, n_features)
+            y: numpy array (n_samples,)
+            metadata: optional list of dicts
+        """
+        self.X = torch.tensor(X, dtype=torch.float32)
+        self.y = torch.tensor(y, dtype=torch.float32)
+        self.metadata = metadata
+        
+    def __len__(self):
+        return len(self.X)
+    
+    def __getitem__(self, idx):
+        if self.metadata is not None:
+            return self.X[idx], self.y[idx], self.metadata[idx]
+        return self.X[idx], self.y[idx]
+
+# =============================================================================
+# STEP 4: FLEXIBLE LSTM MODEL
+# =============================================================================
+
+class FlexibleOptionPriceLSTM(nn.Module):
+    """
+    Flexible LSTM model for option price prediction
+    """
+    
+    def __init__(
+        self,
+        input_size=4,
+        sequence_length=50,
+        hidden_size=128,
+        num_layers=3,
+        dropout=0.2,
+        fc_hidden_sizes=[64],
+        use_batch_norm=False
+    ):
+        super(FlexibleOptionPriceLSTM, self).__init__()
+        
+        self.input_size = input_size
+        self.sequence_length = sequence_length
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.dropout = dropout
+        self.use_batch_norm = use_batch_norm
+        
+        # LSTM layers
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0
+        )
+        
+        # Fully connected layers
+        self.fc_layers = nn.ModuleList()
+        self.bn_layers = nn.ModuleList() if use_batch_norm else None
+        self.dropout_layers = nn.ModuleList()
+        
+        prev_size = hidden_size
+        for fc_size in fc_hidden_sizes:
+            self.fc_layers.append(nn.Linear(prev_size, fc_size))
+            if use_batch_norm:
+                self.bn_layers.append(nn.BatchNorm1d(fc_size))
+            self.dropout_layers.append(nn.Dropout(dropout))
+            prev_size = fc_size
+        
+        self.output_layer = nn.Linear(prev_size, 1)
+        self.relu = nn.ReLU()
+        
+        self._init_weights()
+        
+    def _init_weights(self):
+        """Initialize weights using Xavier initialization"""
+        for name, param in self.lstm.named_parameters():
+            if 'weight' in name:
+                nn.init.xavier_uniform_(param)
+            elif 'bias' in name:
+                nn.init.zeros_(param)
+        
+        for layer in self.fc_layers:
+            nn.init.xavier_uniform_(layer.weight)
+            nn.init.zeros_(layer.bias)
+        
+        nn.init.xavier_uniform_(self.output_layer.weight)
+        nn.init.zeros_(self.output_layer.bias)
+    
+    def forward(self, x):
+        lstm_out, (h_n, c_n) = self.lstm(x)
+        last_output = lstm_out[:, -1, :]
+        
+        out = last_output
+        for i, fc_layer in enumerate(self.fc_layers):
+            out = fc_layer(out)
+            if self.use_batch_norm:
+                out = self.bn_layers[i](out)
+            out = self.relu(out)
+            out = self.dropout_layers[i](out)
+        
+        out = self.output_layer(out)
+        out = out.squeeze(-1)
+        
+        return out
+    
+    def get_config(self):
+        """Return model configuration as dict"""
+        return {
+            'input_size': self.input_size,
+            'sequence_length': self.sequence_length,
+            'hidden_size': self.hidden_size,
+            'num_layers': self.num_layers,
+            'dropout': self.dropout,
+            'use_batch_norm': self.use_batch_norm
+        }
+
+# =============================================================================
+# STEP 5: TRAINING FUNCTIONS
+# =============================================================================
+
+def train_epoch(model, dataloader, criterion, optimizer, device, clip_grad=1.0):
+    """Train for one epoch"""
+    model.train()
+    total_loss = 0
+    n_batches = 0
+    
+    pbar = tqdm(dataloader, desc='Training')
+    
+    for batch_X, batch_y in pbar:
+        batch_X = batch_X.to(device)
+        batch_y = batch_y.to(device)
+        
+        optimizer.zero_grad()
+        predictions = model(batch_X)
+        loss = criterion(predictions, batch_y)
+        loss.backward()
+        
+        if clip_grad is not None:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad)
+        
+        optimizer.step()
+        
+        total_loss += loss.item()
+        n_batches += 1
+        pbar.set_postfix({'loss': f'{loss.item():.6f}'})
+    
+    return total_loss / n_batches
+
+def validate(model, dataloader, criterion, device):
+    """Validate model"""
+    model.eval()
+    total_loss = 0
+    n_batches = 0
+    
+    with torch.no_grad():
+        for batch_X, batch_y in tqdm(dataloader, desc='Validation'):
+            batch_X = batch_X.to(device)
+            batch_y = batch_y.to(device)
+            
+            predictions = model(batch_X)
+            loss = criterion(predictions, batch_y)
+            
+            total_loss += loss.item()
+            n_batches += 1
+    
+    return total_loss / n_batches
+
+def train_model(
+    model,
+    train_loader,
+    val_loader,
+    criterion,
+    optimizer,
+    scheduler,
+    device,
+    num_epochs=50,
+    early_stopping_patience=10,
+    save_path='best_model.pth',
+    clip_grad=1.0
+):
+    """Complete training loop with early stopping"""
+    
+    history = {
+        'train_loss': [],
+        'val_loss': [],
+        'learning_rate': []
+    }
+    
+    best_val_loss = float('inf')
+    patience_counter = 0
+    best_model_state = None
+    
+    print(f"\n{'='*70}")
+    print(f"TRAINING ON {device}")
+    print(f"{'='*70}")
+    print(f"{'Epoch':<10} {'Train Loss':<15} {'Val Loss':<15} {'LR':<15} {'Status':<20}")
+    print(f"{'='*70}")
+    
+    for epoch in range(num_epochs):
+        train_loss = train_epoch(model, train_loader, criterion, optimizer, device, clip_grad)
+        val_loss = validate(model, val_loader, criterion, device)
+        current_lr = optimizer.param_groups[0]['lr']
+        
+        history['train_loss'].append(train_loss)
+        history['val_loss'].append(val_loss)
+        history['learning_rate'].append(current_lr)
+        
+        scheduler.step(val_loss)
+        
+        status = ""
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            best_model_state = model.state_dict().copy()
+            torch.save(best_model_state, save_path)
+            status = "✓ Best model saved"
+        else:
+            patience_counter += 1
+            status = f"No improvement ({patience_counter}/{early_stopping_patience})"
+        
+        print(f"{epoch+1:<10} {train_loss:<15.6f} {val_loss:<15.6f} {current_lr:<15.8f} {status:<20}")
+        
+        if patience_counter >= early_stopping_patience:
+            print(f"\n{'='*70}")
+            print(f"Early stopping triggered at epoch {epoch+1}")
+            print(f"Best validation loss: {best_val_loss:.6f}")
+            print(f"{'='*70}")
+            break
+    
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+        print("\nBest model restored!")
+    
+    return history, best_model_state
+
+# =============================================================================
+# STEP 6: EVALUATION FUNCTIONS
+# =============================================================================
+
+def evaluate_model(model, dataloader, scaler_y, device):
+    """Evaluate model and return predictions"""
+    model.eval()
+    predictions = []
+    actuals = []
+    
+    with torch.no_grad():
+        for batch_X, batch_y in tqdm(dataloader, desc='Evaluating'):
+            batch_X = batch_X.to(device)
+            pred = model(batch_X).cpu().numpy()
+            predictions.extend(pred)
+            actuals.extend(batch_y.numpy())
+    
+    y_pred = scaler_y.inverse_transform(np.array(predictions).reshape(-1, 1)).flatten()
+    y_true = scaler_y.inverse_transform(np.array(actuals).reshape(-1, 1)).flatten()
+    
+    return y_true, y_pred
+
+def calculate_metrics(y_true, y_pred):
+    """Calculate regression metrics"""
+    mse = mean_squared_error(y_true, y_pred)
+    rmse = np.sqrt(mse)
+    mae = mean_absolute_error(y_true, y_pred)
+    r2 = r2_score(y_true, y_pred)
+    
+    mask = y_true != 0
+    mape = np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100
+    
+    return {
+        'MSE': mse,
+        'RMSE': rmse,
+        'MAE': mae,
+        'R2': r2,
+        'MAPE': mape
+    }
+
+def plot_training_history(history, save_path='training_history.png'):
+    """Plot training history"""
+    fig, axes = plt.subplots(1, 2, figsize=(15, 5))
+    
+    axes[0].plot(history['train_loss'], label='Training Loss', linewidth=2)
+    axes[0].plot(history['val_loss'], label='Validation Loss', linewidth=2)
+    axes[0].set_xlabel('Epoch', fontsize=12)
+    axes[0].set_ylabel('Loss (MSE)', fontsize=12)
+    axes[0].set_title('Training and Validation Loss', fontsize=14, fontweight='bold')
+    axes[0].legend(fontsize=10)
+    axes[0].grid(True, alpha=0.3)
+    
+    axes[1].plot(history['learning_rate'], linewidth=2, color='green')
+    axes[1].set_xlabel('Epoch', fontsize=12)
+    axes[1].set_ylabel('Learning Rate', fontsize=12)
+    axes[1].set_title('Learning Rate Schedule', fontsize=14, fontweight='bold')
+    axes[1].set_yscale('log')
+    axes[1].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"\nTraining history plot saved to {save_path}")
+    plt.show()
+
+def plot_predictions(y_true, y_pred, save_path='predictions.png', n_samples=1000):
+    """Plot predicted vs actual values"""
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+    
+    if len(y_true) > n_samples:
+        indices = np.random.choice(len(y_true), n_samples, replace=False)
+        y_true_sample = y_true[indices]
+        y_pred_sample = y_pred[indices]
+    else:
+        y_true_sample = y_true
+        y_pred_sample = y_pred
+    
+    axes[0].scatter(y_true_sample, y_pred_sample, alpha=0.5, s=10)
+    axes[0].plot([y_true.min(), y_true.max()], 
+                 [y_true.min(), y_true.max()], 
+                 'r--', linewidth=2, label='Perfect Prediction')
+    axes[0].set_xlabel('True Call Price (£)', fontsize=12)
+    axes[0].set_ylabel('Predicted Call Price (£)', fontsize=12)
+    axes[0].set_title('Predicted vs Actual', fontsize=14, fontweight='bold')
+    axes[0].legend(fontsize=10)
+    axes[0].grid(True, alpha=0.3)
+    
+    errors = y_pred - y_true
+    axes[1].hist(errors, bins=50, alpha=0.7, edgecolor='black')
+    axes[1].axvline(x=0, color='r', linestyle='--', linewidth=2, label='Zero Error')
+    axes[1].set_xlabel('Prediction Error (£)', fontsize=12)
+    axes[1].set_ylabel('Frequency', fontsize=12)
+    axes[1].set_title('Error Distribution', fontsize=14, fontweight='bold')
+    axes[1].legend(fontsize=10)
+    axes[1].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"Predictions plot saved to {save_path}")
+    plt.show()
+
+# =============================================================================
+# STEP 7: MAIN PIPELINE FUNCTION
+# =============================================================================
+
+def run_lstm_pipeline(
+    df,
+    sequence_length=50,
+    features=['S', 'sigma', 'T', 'K'],
+    train_split=0.7,
+    val_split=0.15,
+    hidden_size=128,
+    num_layers=3,
+    dropout=0.2,
+    fc_hidden_sizes=[64],
+    use_batch_norm=False,
+    batch_size=256,
+    learning_rate=0.001,
+    num_epochs=50,
+    early_stopping_patience=10,
+    weight_decay=1e-5,
+    clip_grad=1.0,
+    seed=42,
+    save_dir='lstm_results',
+    use_cached_sequences=False,
+    cache_prefix='sequences'
+):
+    """
+    Complete LSTM pipeline from data to trained model
+    """
+    
+    set_seed(seed)
+    os.makedirs(save_dir, exist_ok=True)
+    
+    print(f"\n{'='*70}")
+    print(f"LSTM OPTION PRICING PIPELINE")
+    print(f"{'='*70}")
+    
+    # =========================================================================
+    # STEP 1: Calculate Black-Scholes prices (if not already present)
+    # =========================================================================
+    if 'call_price' not in df.columns:
+        print("\nStep 1: Calculating Black-Scholes prices...")
+        r = 0.05
+        df['call_price'] = black_scholes_call(
+            S=df['S'].values,
+            K=df['K'].values,
+            T=df['T'].values,
+            r=r,
+            sigma=df['sigma'].values
+        )
+        print(f"Call price statistics:")
+        print(df['call_price'].describe())
+    else:
+        print("\nStep 1: Black-Scholes prices already present in DataFrame")
+    
+    # =========================================================================
+    # STEP 2: Create or load sequences
+    # =========================================================================
+    if use_cached_sequences and os.path.exists(f'{cache_prefix}_X.npy'):
+        print("\nStep 2: Loading cached sequences...")
+        X, y, metadata = load_sequences(cache_prefix)
+    else:
+        print("\nStep 2: Creating sequences...")
+        X, y, metadata = create_sequences_fast(
+            df, 
+            sequence_length=sequence_length, 
+            features=features,
+            save_metadata=False  # Set to True if you need metadata
+        )
+        
+        # Optionally save for next time
+        print("\nDo you want to save these sequences for faster loading next time? (Recommended)")
+        save_sequences(X, y, metadata, prefix=cache_prefix)
+    
+    # =========================================================================
+    # STEP 3: Split data by simulation
+    # =========================================================================
+    print("\nStep 3: Splitting data...")
+    
+    n_sims = df['simulation'].nunique()
+    train_sims = int(train_split * n_sims)
+    val_sims = int(val_split * n_sims)
+    
+    # Calculate samples per simulation
+    samples_per_sim = len(X) // n_sims
+    
+    # Create masks based on sample index
+    train_samples = train_sims * samples_per_sim
+    val_samples = val_sims * samples_per_sim
+    
+    train_mask = np.arange(len(X)) < train_samples
+    val_mask = (np.arange(len(X)) >= train_samples) & (np.arange(len(X)) < train_samples + val_samples)
+    test_mask = np.arange(len(X)) >= train_samples + val_samples
+    
+    print(f"Train simulations: 0 to {train_sims-1}")
+    print(f"Val simulations: {train_sims} to {train_sims + val_sims - 1}")
+    print(f"Test simulations: {train_sims + val_sims} to {n_sims-1}")
+    
+    X_train, y_train = X[train_mask], y[train_mask]
+    X_val, y_val = X[val_mask], y[val_mask]
+    X_test, y_test = X[test_mask], y[test_mask]
+    
+    print(f"\nData split:")
+    print(f"  Train: {len(X_train):,} samples ({len(X_train)/len(X)*100:.1f}%)")
+    print(f"  Val:   {len(X_val):,} samples ({len(X_val)/len(X)*100:.1f}%)")
+    print(f"  Test:  {len(X_test):,} samples ({len(X_test)/len(X)*100:.1f}%)")
+    
+    # =========================================================================
+    # STEP 4: Scale features
+    # =========================================================================
+    print("\nStep 4: Scaling features...")
+    
+    n_samples_train, seq_len, n_features = X_train.shape
+    
+    scaler_X = StandardScaler()
+    X_train_scaled = scaler_X.fit_transform(
+        X_train.reshape(-1, n_features)
+    ).reshape(n_samples_train, seq_len, n_features)
+    
+    X_val_scaled = scaler_X.transform(
+        X_val.reshape(-1, n_features)
+    ).reshape(len(X_val), seq_len, n_features)
+    
+    X_test_scaled = scaler_X.transform(
+        X_test.reshape(-1, n_features)
+    ).reshape(len(X_test), seq_len, n_features)
+    
+    scaler_y = StandardScaler()
+    y_train_scaled = scaler_y.fit_transform(y_train.reshape(-1, 1)).flatten()
+    y_val_scaled = scaler_y.transform(y_val.reshape(-1, 1)).flatten()
+    y_test_scaled = scaler_y.transform(y_test.reshape(-1, 1)).flatten()
+    
+    print("Scaling complete!")
+    
+    # =========================================================================
+    # STEP 5: Create datasets and dataloaders
+    # =========================================================================
+    print("\nStep 5: Creating DataLoaders...")
+    
+    train_dataset = OptionPriceDataset(X_train_scaled, y_train_scaled)
+    val_dataset = OptionPriceDataset(X_val_scaled, y_val_scaled)
+    test_dataset = OptionPriceDataset(X_test_scaled, y_test_scaled)
+    
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=batch_size, 
+        shuffle=True, 
+        num_workers=0,
+        pin_memory=True if torch.cuda.is_available() else False
+    )
+    
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=batch_size, 
+        shuffle=False, 
+        num_workers=0,
+        pin_memory=True if torch.cuda.is_available() else False
+    )
+    
+    test_loader = DataLoader(
+        test_dataset, 
+        batch_size=batch_size, 
+        shuffle=False, 
+        num_workers=0,
+        pin_memory=True if torch.cuda.is_available() else False
+    )
+    
+    print(f"Batch size: {batch_size}")
+    print(f"Train batches: {len(train_loader)}")
+    print(f"Val batches: {len(val_loader)}")
+    print(f"Test batches: {len(test_loader)}")
+    
+    # =========================================================================
+    # STEP 6: Initialize model
+    # =========================================================================
+    print("\nStep 6: Initializing model...")
+    
+    model = FlexibleOptionPriceLSTM(
+        input_size=len(features),
+        sequence_length=sequence_length,
+        hidden_size=hidden_size,
+        num_layers=num_layers,
+        dropout=dropout,
+        fc_hidden_sizes=fc_hidden_sizes,
+        use_batch_norm=use_batch_norm
+    ).to(device)
+    
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    print(f"\nModel Architecture:")
+    print(f"  Input size: {len(features)} features")
+    print(f"  Sequence length: {sequence_length} timesteps")
+    print(f"  LSTM hidden size: {hidden_size}")
+    print(f"  LSTM layers: {num_layers}")
+    print(f"  FC hidden sizes: {fc_hidden_sizes}")
+    print(f"  Dropout: {dropout}")
+    print(f"  Batch normalization: {use_batch_norm}")
+    print(f"  Total parameters: {total_params:,}")
+    print(f"  Trainable parameters: {trainable_params:,}")
+    
+    # =========================================================================
+    # STEP 7: Setup training
+    # =========================================================================
+    print("\nStep 7: Setting up training...")
+    
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(
+        model.parameters(), 
+        lr=learning_rate, 
+        weight_decay=weight_decay
+    )
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, 
+        mode='min', 
+        factor=0.5, 
+        patience=5, 
+        min_lr=1e-7,
+        verbose=True
+    )
+    
+    print(f"Loss function: MSE")
+    print(f"Optimizer: Adam (lr={learning_rate}, weight_decay={weight_decay})")
+    print(f"Scheduler: ReduceLROnPlateau")
+    print(f"Gradient clipping: {clip_grad}")
+    
+    # =========================================================================
+    # STEP 8: Train model
+    # =========================================================================
+    print("\nStep 8: Training model...")
+    
+    history, best_model_state = train_model(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        criterion=criterion,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        device=device,
+        num_epochs=num_epochs,
+        early_stopping_patience=early_stopping_patience,
+        save_path=os.path.join(save_dir, 'best_model.pth'),
+        clip_grad=clip_grad
+    )
+    
+    # =========================================================================
+    # STEP 9: Evaluate on test set
+    # =========================================================================
+    print("\nStep 9: Evaluating on test set...")
+    
+    y_true, y_pred = evaluate_model(model, test_loader, scaler_y, device)
+    metrics = calculate_metrics(y_true, y_pred)
+    
+    print(f"\n{'='*70}")
+    print(f"TEST SET RESULTS")
+    print(f"{'='*70}")
+    for metric_name, metric_value in metrics.items():
+        print(f"{metric_name:<10}: {metric_value:>12.6f}")
+    print(f"{'='*70}")
+    
+    # =========================================================================
+    # STEP 10: Save results and plots
+    # =========================================================================
+    print("\nStep 10: Saving results...")
+    
+    plot_training_history(history, os.path.join(save_dir, 'training_history.png'))
+    plot_predictions(y_true, y_pred, os.path.join(save_dir, 'predictions.png'))
+    
+    with open(os.path.join(save_dir, 'metrics.json'), 'w') as f:
+        json.dump(metrics, f, indent=2)
+    
+    config = {
+        'model_config': model.get_config(),
+        'training_config': {
+            'sequence_length': sequence_length,
+            'features': features,
+            'batch_size': batch_size,
+            'learning_rate': learning_rate,
+            'num_epochs': len(history['train_loss']),
+            'early_stopping_patience': early_stopping_patience
+        },
+        'data_config': {
+            'train_samples': len(X_train),
+            'val_samples': len(X_val),
+            'test_samples': len(X_test),
+            'train_split': train_split,
+            'val_split': val_split
+        }
+    }
+    
+    with open(os.path.join(save_dir, 'config.json'), 'w') as f:
+        json.dump(config, f, indent=2)
+    
+    print(f"\nAll results saved to {save_dir}/")
+    
+    return model, history, metrics, {'scaler_X': scaler_X, 'scaler_y': scaler_y}
+
+# =============================================================================
+# STEP 8: EXAMPLE USAGE
+# =============================================================================
+
+if __name__ == "__main__":
+    """
+    Example usage - Start with small subset for testing
+    """
+    
+    # =========================================================================
+    # LOAD DATA
+    # =========================================================================
+    print("="*70)
+    print("LOADING DATA")
+    print("="*70)
+    
+    df = pd.read_csv('ftse_garch_simulation_data_T5.csv')
+    print(f"Loaded {len(df):,} rows")
+    print(f"Total simulations: {df['simulation'].nunique():,}")
+    
+    # =========================================================================
+    # OPTION 1: TEST WITH SMALL SUBSET FIRST (RECOMMENDED)
+    # =========================================================================
+    print("\n" + "="*70)
+    print("TESTING WITH 1,000 SIMULATIONS FIRST")
+    print("="*70)
+    
+    df_test = df[df['simulation'] < 1000].copy()
+    print(f"Using {df_test['simulation'].nunique():,} simulations for testing")
+    
+    model_test, history_test, metrics_test, scalers_test = run_lstm_pipeline(
+        df=df_test,
+        sequence_length=50,
+        features=['S', 'sigma', 'T', 'K'],
+        hidden_size=64,  # Smaller for faster testing
+        num_layers=2,
+        dropout=0.2,
+        fc_hidden_sizes=[32],
+        batch_size=512,
+        learning_rate=0.001,
+        num_epochs=10,  # Fewer epochs for testing
+        early_stopping_patience=5,
+        save_dir='lstm_results_test',
+        use_cached_sequences=False,
+        cache_prefix='sequences_test'
+    )
+    
+    print("\n" + "="*70)
+    print("TEST COMPLETE!")
+    print("If satisfied with results, uncomment the full training below")
+    print("="*70)
+    
+    # =========================================================================
+    # OPTION 2: FULL TRAINING (UNCOMMENT WHEN READY)
+    # =========================================================================
+    """
+    print("\n" + "="*70)
+    print("FULL TRAINING WITH ALL 100,000 SIMULATIONS")
+    print("="*70)
+    
+    model_full, history_full, metrics_full, scalers_full = run_lstm_pipeline(
+        df=df,
+        sequence_length=50,
+        features=['S', 'sigma', 'T', 'K'],
+        hidden_size=128,
+        num_layers=3,
+        dropout=0.2,
+        fc_hidden_sizes=[64],
+        batch_size=256,
+        learning_rate=0.001,
+        num_epochs=50,
+        early_stopping_patience=10,
+        save_dir='lstm_results_full',
+        use_cached_sequences=True,  # Use cached sequences if available
+        cache_prefix='sequences_full'
+    )
+    """
+    
+    print("\n" + "="*70)
+    print("ALL DONE!")
+    print("="*70)

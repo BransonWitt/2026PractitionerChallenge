@@ -17,7 +17,6 @@ MASTER_SEED = 42  # Change this to generate different datasets
 def set_all_seeds(seed):
     """Set all random seeds for reproducibility"""
     np.random.seed(seed)
-    # If using other libraries, set their seeds here
     print(f"All seeds set to: {seed}")
 
 def compute_dataframe_hash(df, sample_size=10000):
@@ -84,24 +83,27 @@ print("\n" + "=" * 70)
 print("STEP 2: SIMULATION PARAMETERS")
 print("=" * 70)
 
-n_simulations = 500000
-T_choices = np.array([1, 2, 3, 4, 5])
+n_simulations = 100000
+T_maturity = 5  # All simulations start at 5 years
 K_percentages = np.array([0.60, 0.70, 0.80, 0.90, 1.00, 1.10, 1.20, 1.30, 1.40, 1.50])
 days_per_year = 252
+n_days = T_maturity * days_per_year  # Total days for each simulation
 mu_adjusted = 0.04
 
 print(f"Total simulations: {n_simulations:,}")
-print(f"T choices: {T_choices} years")
+print(f"Maturity (T): {T_maturity} years for ALL simulations")
+print(f"Days per simulation: {n_days}")
 print(f"K choices: {K_percentages * 100}%")
 
 # Store metadata for reproducibility
 metadata = {
     'master_seed': MASTER_SEED,
     'n_simulations': int(n_simulations),
-    'T_choices': T_choices.tolist(),
+    'T_maturity': int(T_maturity),
     'K_percentages': K_percentages.tolist(),
     'S0': float(S0),
     'days_per_year': int(days_per_year),
+    'n_days': int(n_days),
     'mu_adjusted': float(mu_adjusted),
     'garch_params': {
         'mu': float(mu),
@@ -123,24 +125,24 @@ metadata = {
 }
 
 # =============================================================================
-# STEP 3: ASSIGN T AND K (WITH SEED CONTROL)
+# STEP 3: ASSIGN K STRIKES (WITH SEED CONTROL)
 # =============================================================================
 
 print("\n" + "=" * 70)
-print("STEP 3: ASSIGNING T AND K")
+print("STEP 3: ASSIGNING STRIKE PRICES")
 print("=" * 70)
 
 # CRITICAL: Set seed before random assignments
 np.random.seed(MASTER_SEED)
 
-T_assignments = np.random.choice(T_choices, size=n_simulations)
+# Each simulation gets ONE randomly assigned strike price
 K_pct_assignments = np.random.choice(K_percentages, size=n_simulations)
 K_assignments = S0 * K_pct_assignments
 
-print(f"T distribution:")
-for t in T_choices:
-    count = np.sum(T_assignments == t)
-    print(f"  T={t}: {count:,} ({count/n_simulations*100:.1f}%)")
+print(f"K distribution:")
+for k_pct in K_percentages:
+    count = np.sum(K_pct_assignments == k_pct)
+    print(f"  K={k_pct*100:.0f}%: {count:,} ({count/n_simulations*100:.1f}%)")
 
 # =============================================================================
 # STEP 4: VECTORIZED GARCH SIMULATION FUNCTION
@@ -185,7 +187,7 @@ def simulate_garch_vectorized(S0, n_days, n_scenarios, mu, omega, alpha, beta, n
     return S_paths, sigma_paths
 
 # =============================================================================
-# STEP 5: RUN SIMULATIONS BY T GROUP (VECTORIZED WITH SEED CONTROL)
+# STEP 5: RUN SIMULATIONS (VECTORIZED WITH SEED CONTROL)
 # =============================================================================
 
 print("\n" + "=" * 70)
@@ -197,96 +199,70 @@ os.makedirs(output_dir, exist_ok=True)
 
 total_start = time.time()
 
-# Store hashes for verification
-file_hashes = {}
+print(f"\nGenerating {n_simulations:,} simulations × {n_days} days")
 
-for T in T_choices:
-    group_start = time.time()
-    
-    # Find all simulations with this T
-    mask = T_assignments == T
-    sim_indices = np.where(mask)[0]
-    n_sims_this_T = len(sim_indices)
-    n_days = T * days_per_year
-    
-    print(f"\nT = {T} years: {n_sims_this_T:,} simulations × {n_days} days")
-    
-    # Get K values for these simulations
-    K_values_this_T = K_assignments[sim_indices]
-    
-    # --- VECTORIZED GARCH SIMULATION WITH SEED ---
-    print(f"  Running GARCH simulation...")
-    sim_start = time.time()
-    
-    # CRITICAL: Use deterministic seed for this T group
-    group_seed = MASTER_SEED + int(T * 1000)
-    
-    S_paths, sigma_paths = simulate_garch_vectorized(
-        S0=S0,
-        n_days=n_days,
-        n_scenarios=n_sims_this_T,
-        mu=mu_adjusted,
-        omega=omega,
-        alpha=alpha,
-        beta=beta,
-        nu=nu,
-        seed=group_seed
-    )
-    
-    print(f"  GARCH done in {time.time() - sim_start:.1f}s")
-    
-    # --- BUILD DATASET (VECTORIZED) ---
-    print(f"  Building dataset...")
-    build_start = time.time()
-    
-    n_rows = n_sims_this_T * n_days
-    
-    simulation_col = np.repeat(sim_indices, n_days)
-    day_col = np.tile(np.arange(n_days), n_sims_this_T)
-    S_col = S_paths.flatten()
-    K_col = np.repeat(K_values_this_T, n_days)
-    T_sequence = T - np.arange(n_days) / days_per_year
-    T_col = np.tile(T_sequence, n_sims_this_T)
-    sigma_col = sigma_paths.flatten() * np.sqrt(days_per_year) / 100
-    
-    print(f"  Arrays built in {time.time() - build_start:.1f}s")
-    
-    # --- CREATE AND SAVE DATAFRAME ---
-    print(f"  Creating DataFrame...")
-    df_start = time.time()
-    
-    df_T = pd.DataFrame({
-        'simulation': simulation_col,
-        'day': day_col,
-        'S': S_col,
-        'K': K_col,
-        'T': T_col,
-        'sigma': sigma_col
-    })
-    
-    # Sort by simulation, then descending T
-    df_T = df_T.sort_values(
-        by=['simulation', 'T'],
-        ascending=[True, False]
-    ).reset_index(drop=True)
-    
-    print(f"  DataFrame created in {time.time() - df_start:.1f}s")
-    
-    # Compute hash for verification
-    file_hash = compute_dataframe_hash(df_T)
-    file_hashes[f'T_{T}_years'] = file_hash
-    print(f"  Data hash: {file_hash}")
-    
-    # Save as CSV
-    filename = f'{output_dir}/T_{T}_years.csv'
-    df_T.to_csv(filename, index=False)
-    
-    group_time = time.time() - group_start
-    print(f"  Saved {len(df_T):,} rows to {filename}")
-    print(f"  Total time for T={T}: {group_time:.1f}s")
-    
-    # Memory cleanup
-    del S_paths, sigma_paths, df_T
+# --- VECTORIZED GARCH SIMULATION WITH SEED ---
+print(f"Running GARCH simulation...")
+sim_start = time.time()
+
+# CRITICAL: Use deterministic seed
+simulation_seed = MASTER_SEED + 5000
+
+S_paths, sigma_paths = simulate_garch_vectorized(
+    S0=S0,
+    n_days=n_days,
+    n_scenarios=n_simulations,
+    mu=mu_adjusted,
+    omega=omega,
+    alpha=alpha,
+    beta=beta,
+    nu=nu,
+    seed=simulation_seed
+)
+
+print(f"GARCH simulation completed in {time.time() - sim_start:.1f}s")
+
+# --- BUILD DATASET (VECTORIZED) ---
+print(f"\nBuilding dataset...")
+build_start = time.time()
+
+n_rows = n_simulations * n_days
+
+# Create arrays for each column
+simulation_col = np.repeat(np.arange(n_simulations), n_days)
+day_col = np.tile(np.arange(n_days), n_simulations)
+S_col = S_paths.flatten()
+K_col = np.repeat(K_assignments, n_days)
+
+# Create T column: starts at T_maturity and decreases each day
+T_sequence = T_maturity - np.arange(n_days) / days_per_year
+T_col = np.tile(T_sequence, n_simulations)
+
+# Convert volatility to annualized percentage
+sigma_col = sigma_paths.flatten() * np.sqrt(days_per_year) / 100
+
+print(f"Arrays built in {time.time() - build_start:.1f}s")
+
+# --- CREATE DATAFRAME ---
+print(f"Creating DataFrame...")
+df_start = time.time()
+
+df = pd.DataFrame({
+    'simulation': simulation_col,
+    'day': day_col,
+    'S': S_col,
+    'K': K_col,
+    'T': T_col,
+    'sigma': sigma_col
+})
+
+# Sort by simulation, then descending T (day ascending)
+df = df.sort_values(
+    by=['simulation', 'day'],
+    ascending=[True, True]
+).reset_index(drop=True)
+
+print(f"DataFrame created in {time.time() - df_start:.1f}s")
 
 total_time = time.time() - total_start
 print(f"\n" + "=" * 70)
@@ -294,84 +270,60 @@ print(f"SIMULATION COMPLETE! Total time: {total_time / 60:.1f} minutes")
 print("=" * 70)
 
 # =============================================================================
-# STEP 6: COMBINE ALL FILES
+# STEP 6: DISPLAY AND SAVE
 # =============================================================================
 
 print("\n" + "=" * 70)
-print("STEP 5: COMBINING FILES")
-print("=" * 70)
-
-print("Loading all CSV files...")
-
-dfs = []
-for T in T_choices:
-    filename = f'{output_dir}/T_{T}_years.csv'
-    df = pd.read_csv(filename)
-    dfs.append(df)
-    print(f"  Loaded T={T}: {len(df):,} rows")
-
-df_combined = pd.concat(dfs, ignore_index=True)
-
-# Final sort
-print("\nFinal sorting...")
-df_combined = df_combined.sort_values(
-    by=['simulation', 'T'],
-    ascending=[True, False]
-).reset_index(drop=True)
-
-print(f"\nFinal dataset: {len(df_combined):,} rows")
-
-# =============================================================================
-# STEP 7: DISPLAY AND SAVE
-# =============================================================================
-
-print("\n" + "=" * 70)
-print("STEP 6: FINAL DATASET")
+print("STEP 5: FINAL DATASET")
 print("=" * 70)
 
 print("\nFirst 20 rows:")
-print(df_combined.head(20))
+print(df.head(20))
 
 print("\nLast 20 rows:")
-print(df_combined.tail(20))
+print(df.tail(20))
 
 print("\nStatistics:")
-print(df_combined.describe())
+print(df.describe())
 
-# Example simulation
-sim_0 = df_combined[df_combined['simulation'] == 0]
-print(f"\nSimulation 0:")
-print(f"  T assigned: {sim_0['T'].iloc[0]:.4f} years")
-print(f"  K assigned: £{sim_0['K'].iloc[0]:,.2f}")
-print(f"  Rows: {len(sim_0)}")
-print(f"  T range: {sim_0['T'].max():.4f} → {sim_0['T'].min():.4f}")
+# Example simulations
+for sim_id in [0, 1, 2]:
+    sim_data = df[df['simulation'] == sim_id]
+    print(f"\nSimulation {sim_id}:")
+    print(f"  K assigned: £{sim_data['K'].iloc[0]:,.2f}")
+    print(f"  Rows: {len(sim_data)}")
+    print(f"  T range: {sim_data['T'].max():.4f} → {sim_data['T'].min():.4f}")
+    print(f"  S range: £{sim_data['S'].min():.2f} → £{sim_data['S'].max():.2f}")
 
 # Compute final hash
-final_hash = compute_dataframe_hash(df_combined)
-print(f"\nFinal dataset hash: {final_hash}")
+print("\nComputing dataset hash...")
+final_hash = compute_dataframe_hash(df)
+print(f"Final dataset hash: {final_hash}")
 
 # Save final file as CSV
 print("\nSaving final dataset...")
-df_combined.to_csv('ftse_garch_simulation_data.csv', index=False)
+save_start = time.time()
+df.to_csv('ftse_garch_simulation_data_T5.csv', index=False)
+save_time = time.time() - save_start
 
-file_size_gb = os.path.getsize('ftse_garch_simulation_data.csv') / 1e9
-print(f"Saved to ftse_garch_simulation_data.csv")
+file_size_gb = os.path.getsize('ftse_garch_simulation_data_T5.csv') / 1e9
+print(f"Saved to ftse_garch_simulation_data_T5.csv in {save_time:.1f}s")
 print(f"File size: {file_size_gb:.2f} GB")
 
 # =============================================================================
-# STEP 8: SAVE METADATA AND VERIFICATION INFO
+# STEP 7: SAVE METADATA AND VERIFICATION INFO
 # =============================================================================
 
 print("\n" + "=" * 70)
-print("STEP 7: SAVING METADATA FOR REPRODUCIBILITY")
+print("STEP 6: SAVING METADATA FOR REPRODUCIBILITY")
 print("=" * 70)
 
 # Add hashes and final statistics to metadata
-metadata['file_hashes'] = file_hashes
 metadata['final_hash'] = final_hash
-metadata['total_rows'] = int(len(df_combined))
+metadata['total_rows'] = int(len(df))
 metadata['file_size_gb'] = float(file_size_gb)
 metadata['total_generation_time_minutes'] = float(total_time / 60)
+metadata['simulation_seed'] = int(simulation_seed)
 
 # Save metadata
 save_metadata(metadata, f'{output_dir}/dataset_metadata.json')
@@ -379,10 +331,13 @@ save_metadata(metadata, f'{output_dir}/dataset_metadata.json')
 # Also save a verification file with just the hash
 verification = {
     'master_seed': MASTER_SEED,
+    'simulation_seed': simulation_seed,
     'final_hash': final_hash,
-    'file_hashes': file_hashes,
-    'total_rows': int(len(df_combined)),
-    'instructions': 'Run the generation script with MASTER_SEED={} to reproduce this exact dataset'.format(MASTER_SEED)
+    'total_rows': int(len(df)),
+    'n_simulations': int(n_simulations),
+    'T_maturity': int(T_maturity),
+    'n_days': int(n_days),
+    'instructions': f'Run the generation script with MASTER_SEED={MASTER_SEED} to reproduce this exact dataset'
 }
 
 with open('REPRODUCIBILITY_INFO.json', 'w') as f:
@@ -396,5 +351,9 @@ print("=" * 70)
 print("\nTo reproduce this dataset on another computer:")
 print(f"1. Use MASTER_SEED = {MASTER_SEED}")
 print(f"2. Expected final hash: {final_hash}")
-print(f"3. Expected total rows: {len(df_combined):,}")
+print(f"3. Expected total rows: {len(df):,}")
+print(f"4. Expected file size: {file_size_gb:.2f} GB")
 print("=" * 70)
+
+# Clean up memory
+del S_paths, sigma_paths

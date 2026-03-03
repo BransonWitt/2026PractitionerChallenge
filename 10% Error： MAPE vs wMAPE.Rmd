@@ -1,0 +1,54 @@
+---
+title: "10% Error: MAPE vs wMAPE"
+output: pdf_document
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code.
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Cmd+Shift+Enter*.
+
+```{r}
+x <- seq(0, 100000, length.out = 500000)
+
+y <- x
+
+upper_mape <- 1.1 * x
+lower_mape <- 0.9 * x
+
+mean_x <- mean(x)
+constant_error <- 0.10 * mean_x
+
+upper_wmape <- x + constant_error
+lower_wmape <- x - constant_error
+
+plot(x, y, type = "l", lwd = 3,
+     xlab = "Actual (A)",
+     ylab = "Prediction (P)",
+     main = "10% Error: MAPE vs wMAPE",
+     ylim = c(-500, 110000))
+
+polygon(c(x, rev(x)),
+        c(upper_mape, rev(lower_mape)),
+        col = rgb(1, 0, 0, 0.2), border = NA)
+
+polygon(c(x, rev(x)),
+        c(upper_wmape, rev(lower_wmape)),
+        col = rgb(0, 0, 1, 0.2), border = NA)
+
+lines(x, y, lwd = 3)
+
+legend("topleft",
+       legend = c("True line y=x",
+                  "MAPE 10% (proportional)",
+                  "wMAPE 10% (constant)"),
+       lwd = c(3, NA, NA),
+       pch = c(NA, 15, 15),
+       pt.cex = 2,
+       col = c("black",
+               rgb(1,0,0,0.4),
+               rgb(0,0,1,0.4)))
+
+col = rgb(1,0,0,0.2)   
+col = rgb(0,0,1,0.2)   
+lwd = 3                
+```
